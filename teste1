@@ -1,142 +1,197 @@
--- language: Luau, target: Roblox mobile (Android ARM64) / Blox Fruits
--- executor: Delta / Codex / Hydrogen -- sem PC, sem mouse, sem loadstring externo
--- PRINCIPIO: mesma disciplina do quiet.lua. Mudam o primitivo de input (toque) e o ritmo (CPU/bateria).
--- Input: sonda SendTouchEvent -> SendPointerEvent -> SendMouseButtonEvent. Backend escolhido em runtime, nao chutado.
-
-local Q = {
-    WalkRange  = 22,              -- so ataca quando ja esta perto de verdade
-    StepJitter = { 0.60, 1.55 },  -- segundos entre acoes, sortido
-    Hold       = { 0.045, 0.115 },-- duracao do toque: curto demais = sintetico, longo = segurar
-    IdleChance = 0.15,            -- prob. de parar 3-9s (o "perdi o foco")
-    MissChance = 0.06,            -- as vezes o toque erra, como gente
-    AimJitter  = 9,               -- pixels de desvio no ponto de toque
-    SessionMax = 22 * 60,         -- celular esquenta e o OS mata o app antes do PC
-    Tick       = 0.30,            -- CPU mobile: varredura mais folgada
-}
+-- language: Luau, target: Blox Fruits (PC + Android)
+-- executor: Delta / Codex / Hydrogen / FlashWorld
+-- sem loadstring externo. so APIs padrao de executor
+-- input sonda SendTouchEvent -> SendPointerEvent -> SendMouseButtonEvent
+-- andar MoveTo. golpe = toque na tela do mob. sem escrever no mundo.
 
 local Players = game:GetService("Players")
-local VIM     = game:GetService("VirtualInputManager")
-local p       = Players.LocalPlayer
-local cam     = workspace.CurrentCamera
-local rnd     = Random.new()
+local VIM = game:GetService("VirtualInputManager")
+local TweenService = game:GetService("TweenService")
+local cam = workspace.CurrentCamera
+local rng = Random.new()
 
-local hrp, hum
-local function bind()
-    local c = p.Character or p.CharacterAdded:Wait()
-    hrp = c:WaitForChild("HumanoidRootPart"); hum = c:FindFirstChildOfClass("Humanoid")
+local p = Players.LocalPlayer
+
+-- ============ CFG ============
+local C = {
+    WalkRange = 24,
+    AttackRange = 30,
+    StepJitter = { 0.55, 1.40 },
+    HoldTouch = { 0.045, 0.115 },
+    AimJitter = 9,
+    MissChance = 0.06,
+    IdleChance = 0.15,
+    SessionSec = 1800,
+    Tick = 0.25,
+    RiskTween = false,
+}
+
+-- ============ ESTADO ============
+local World = { hrp = nil, hum = nil }
+local Input = { backend = nil, fail = 0, seq = 0 }
+local running = true
+
+-- ============ CAMADA INPUT ============
+local impls = {}
+if type(VIM.SendTouchEvent) == "function" then
+    impls[#impls + 1] = { "SendTouchEvent", function(st, id, pos) VIM:SendTouchEvent(st, id, pos) end }
 end
-bind(); p.CharacterAdded:Connect(function() task.wait(1.2); bind() end)
+if type(VIM.SendPointerEvent) == "function" then
+    impls[#impls + 1] = { "SendPointerEvent", function(st, id, pos) VIM:SendPointerEvent(st, Enum.PointerType.Touch, pos) end }
+end
+if type(VIM.SendMouseButtonEvent) == "function" then
+    impls[#impls + 1] = { "SendMouseButtonEvent", function(st, id, pos)
+        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, st == Enum.UserInputState.Begin, game, 1, false)
+    end }
+end
 
-local function alive() return hrp and hum and hum.Health > 0 end
+print(("[BF] backend disponivel: %s"):format(
+    next(impls) and table.concat(impls, ", ", function(_, v) return v[1] end)
+    or "nenhum"))
 
--- MoveTo e o pathfinding do proprio jogo: o servidor ve personagem andando, nao saltando
-local function walkTo(pos)
-    if not alive() then return end
-    hum:MoveTo(pos + Vector3.new(rnd:NextNumber(-2, 2), 0, rnd:NextNumber(-2, 2)))
-    local t0 = os.clock()
-    repeat
-        task.wait(Q.Tick)
-        if (hrp.Position - pos).Magnitude < 8 then return end
-    until os.clock() - t0 > 7
+function Input.tap(pos, holdMin, holdMax)
+    if #impls == 0 then return false end
+    Input.seq += 1
+    local id = 7000 + (Input.seq % 2000)
+    local held = rng:NextNumber(holdMin or C.HoldTouch[1], holdMax or C.HoldTouch[2])
+    local start = 1
+    if Input.backend then
+        for i, c in ipairs(impls) do if c[1] == Input.backend then start = i break end end
+    end
+    for a = start, #impls do
+        local ok = pcall(impls[a][2], Enum.UserInputState.Begin, id, pos)
+        if ok then
+            task.wait(held)
+            pcall(impls[a][2], Enum.UserInputState.End, id, pos)
+            Input.backend = impls[a][1]
+            Input.fail = 0
+            return true
+        end
+        Input.fail += 1
+    end
+    return false
+end
+
+function Input.calibrate()
+    local vp = cam.ViewportSize
+    local ok, name = Input.tap(Vector2.new(vp.X * 0.5, vp.Y * 0.5)), Input.backend
+    print(("[BF] calib: %s -> %s"):format(tostring(name), ok and "enviado" or "NENHUM respondeu"))
+    return ok, name
+end
+
+-- ============ RESOLVERS ============
+function World.bind()
+    local c = p.Character
+    if not c or not c:FindFirstChild("HumanoidRootPart") then
+        c = p.CharacterAdded:Wait(20)
+    end
+    if not c then return end
+    World.hrp = c:WaitForChild("HumanoidRootPart", 20)
+    World.hum = c:FindFirstChildOfClass("Humanoid")
+end
+World.bind()
+p.CharacterAdded:Connect(function() task.wait(1); World.bind() end)
+
+local function alive()
+    return World.hrp and World.hum and World.hum.Health > 0
 end
 
 local function nearestMob()
-    local set = workspace:FindFirstChild("Enemies"); if not set then return nil end
+    local set = workspace:FindFirstChild("Enemies")
+    if not set then return nil, math.huge end
     local best, d = nil, math.huge
     for _, m in ipairs(set:GetChildren()) do
         local h, r = m:FindFirstChildOfClass("Humanoid"), m:FindFirstChild("HumanoidRootPart")
         if h and r and h.Health > 0 and m.Name ~= "BusoTemplate" then
-            local dd = (r.Position - hrp.Position).Magnitude
-            if dd < d then d, best = dd, m end
+            local dist = (r.Position - World.hrp.Position).Magnitude
+            if dist < d then d, best = dist, m end
         end
     end
     return best, d
 end
 
--- ============ CAMADA DE INPUT (sonda em ordem, degrada se falhar) ============
-local impls = {}
-if type(VIM.SendTouchEvent) == "function" then
-    impls[#impls + 1] = { "SendTouchEvent", function(st, id, pos)
-        VIM:SendTouchEvent(st, id, pos)
-    end }
-end
-if type(VIM.SendPointerEvent) == "function" then
-    impls[#impls + 1] = { "SendPointerEvent", function(st, id, pos)
-        VIM:SendPointerEvent(st, Enum.PointerType.Touch, pos)
-    end }
-end
-if type(VIM.SendMouseButtonEvent) == "function" then
-    impls[#impls + 1] = { "SendMouseButtonEvent", function(st, id, pos)
-        -- botao 0 = esquerdo/touch primario nessa API
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, st == Enum.UserInputState.Begin, game, 1, false)
-    end }
-end
-
-local idx, touchSeq = 1, 0
-local function tap(pos)
-    if #impls == 0 then return false, nil end
-    touchSeq += 1
-    local id = 7000 + (touchSeq % 2000)
-    local held = rnd:NextNumber(Q.Hold[1], Q.Hold[2])
-    for attempt = idx, #impls do
-        local entry = impls[attempt]
-        local ok = pcall(entry[2], Enum.UserInputState.Begin, id, pos)
-        if ok then
-            task.wait(held)
-            pcall(entry[2], Enum.UserInputState.End, id, pos)
-            idx = attempt
-            return true, entry[1]
-        end
-    end
-    return false, nil
-end
-
-local function screenOf(mob)
-    local r = mob:FindFirstChild("HumanoidRootPart"); if not r then return nil end
-    local sp, on = cam:WorldToViewportPoint(r.Position)
+local function screenPos(part)
+    if not part then return nil end
+    local sp, on = cam:WorldToViewportPoint(part.Position)
     if not on then return nil end
     return Vector2.new(sp.X, sp.Y)
 end
 
--- ============ CALIBRACAO: rode ANTES do farm. Um toque no centro da tela. ============
--- Se o personagem der um golpe/travada ao rodar isto, o backend escolhido esta falando a lingua do jogo.
-_G.QuietCalib = function()
-    local vp = cam.ViewportSize
-    local ok, name = tap(Vector2.new(vp.X * 0.5, vp.Y * 0.5))
-    print(("[quiet-m] calib: %s -> %s"):format(tostring(name), ok and "enviado" or "NENHUM backend respondeu"))
-    return ok
+-- ============ MOVIMENTO ============
+local function walkTo(pos)
+    if not alive() then return end
+    World.hum:MoveTo(pos + Vector3.new(rng:NextNumber(-2, 2), 0, rng:NextNumber(-2, 2)))
+    local t0 = os.clock()
+    repeat
+        task.wait(C.Tick)
+        if (World.hrp.Position - pos).Magnitude < 8 then return true end
+    until os.clock() - t0 > 7
+    return false
 end
 
-print(("[quiet-m] backend de input: %s"):format(impls[idx] and impls[idx][1] or "nenhum -- o script vai andar mas nao batera"))
+local function tweenTo(pos)
+    if not alive() then return end
+    local d = (pos - World.hrp.Position).Magnitude
+    local tw = TweenService:Create(World.hrp, TweenInfo.new(math.max(d / 320, 0.05), Enum.EasingStyle.Linear), { CFrame = CFrame.new(pos) })
+    tw:Play()
+    pcall(function() tw.Completed:Wait() end)
+end
 
-_G.Quiet = true
+local function moveTo(pos)
+    if C.RiskTween then tweenTo(pos) else walkTo(pos) end
+end
+
+-- ============ LOOP PRINCIPAL ============
+_G.BFRunning = true
 task.spawn(function()
     local t0 = os.clock()
-    while _G.Quiet and (os.clock() - t0) < Q.SessionMax do
-        if not alive() then task.wait(4); bind(); continue end
+    while _G.BFRunning and (os.clock() - t0) < C.SessionSec do
+        if not alive() then task.wait(3); World.bind(); continue end
+
         local mob, dist = nearestMob()
         if mob then
-            if dist > Q.WalkRange then walkTo(mob.HumanoidRootPart.Position) end
-            for _ = 1, math.random(3, 7) do
+            if dist > C.WalkRange then
+                moveTo(mob.HumanoidRootPart.Position)
+            end
+
+            for _ = 1, math.random(3, 6) do
                 local h = mob:FindFirstChildOfClass("Humanoid")
                 if not h or h.Health <= 0 then break end
-                local pos = screenOf(mob)
-                if pos and math.random() > Q.MissChance then
-                    tap(pos + Vector2.new(
-                        rnd:NextNumber(-Q.AimJitter, Q.AimJitter),
-                        rnd:NextNumber(-Q.AimJitter, Q.AimJitter)))
+                local sp = screenPos(mob.HumanoidRootPart)
+                if sp and math.random() > C.MissChance then
+                    sp = sp + Vector2.new(rng:NextNumber(-C.AimJitter, C.AimJitter),
+                                          rng:NextNumber(-C.AimJitter, C.AimJitter))
+                    Input.tap(sp)
                 end
-                task.wait(rnd:NextNumber(Q.StepJitter[1], Q.StepJitter[2]) / 4)
+                task.wait(rng:NextNumber(C.StepJitter[1], C.StepJitter[2]) / 4)
             end
-        end
-        if math.random() < Q.IdleChance then
-            task.wait(rnd:NextNumber(3, 9))
         else
-            task.wait(rnd:NextNumber(Q.StepJitter[1], Q.StepJitter[2]))
+            task.wait(C.Tick * 2)
+        end
+
+        if math.random() < C.IdleChance then
+            task.wait(rng:NextNumber(3, 9))
+        else
+            task.wait(rng:NextNumber(C.StepJitter[1], C.StepJitter[2]))
         end
     end
-    print("[quiet-m] sessao encerrada por limite de tempo")
+    print("[BF] sessao encerrada")
 end)
 
--- parar: _G.Quiet = false
--- ajustar: _G.Quiet = false; depois edite Q.* e rode de novo
+-- ============ CONTROLADOR ============
+_G.BFStop = function()
+    _G.BFRunning = false
+    print("[BF] parado")
+end
+
+_G.BFSet = function(k, v)
+    C[k] = v
+    print(("[BF] %s = %s"):format(k, tostring(v)))
+end
+
+_G.BFCalib = function()
+    local vp = cam.ViewportSize
+    local ok, name = Input.tap(Vector2.new(vp.X * 0.5, vp.Y * 0.5)), Input.backend
+    print(("[BF] calib: %s -> %s"):format(tostring(name), ok and "enviado" or "NENHUM respondeu"))
+    return ok, name
+end
