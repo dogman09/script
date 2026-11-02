@@ -1,197 +1,130 @@
--- language: Luau, target: Blox Fruits (PC + Android)
--- executor: Delta / Codex / Hydrogen / FlashWorld
--- sem loadstring externo. so APIs padrao de executor
--- input sonda SendTouchEvent -> SendPointerEvent -> SendMouseButtonEvent
--- andar MoveTo. golpe = toque na tela do mob. sem escrever no mundo.
-
-local Players = game:GetService("Players")
-local VIM = game:GetService("VirtualInputManager")
-local TweenService = game:GetService("TweenService")
-local cam = workspace.CurrentCamera
-local rng = Random.new()
-
-local p = Players.LocalPlayer
-
--- ============ CFG ============
-local C = {
-    WalkRange = 24,
-    AttackRange = 30,
-    StepJitter = { 0.55, 1.40 },
-    HoldTouch = { 0.045, 0.115 },
-    AimJitter = 9,
-    MissChance = 0.06,
-    IdleChance = 0.15,
-    SessionSec = 1800,
-    Tick = 0.25,
-    RiskTween = false,
-}
-
--- ============ ESTADO ============
-local World = { hrp = nil, hum = nil }
-local Input = { backend = nil, fail = 0, seq = 0 }
-local running = true
-
--- ============ CAMADA INPUT ============
-local impls = {}
-if type(VIM.SendTouchEvent) == "function" then
-    impls[#impls + 1] = { "SendTouchEvent", function(st, id, pos) VIM:SendTouchEvent(st, id, pos) end }
+_G.__bf={stop=false}
+_G.BFStop=function() _G.__bf.stop=true; print("[BF] parado") end
+_G.BFSet=function(k,v) if _G.__bf.cfg then _G.__bf.cfg[k]=v; print(("[BF] %s=%s"):format(k,tostring(v))) end end
+_G.BFStatus=function()
+    local b=_G.__bf
+    print("HRP: " .. tostring(b.hrp and "OK" or "FALTO"))
+    print("Enemies: " .. tostring(workspace:FindFirstChild("Enemies") and "OK" or "NAO") )
+    print("Backend: " .. tostring(b.backend or "NENHUM"))
+    print("Running: " .. tostring(not b.stop))
 end
-if type(VIM.SendPointerEvent) == "function" then
-    impls[#impls + 1] = { "SendPointerEvent", function(st, id, pos) VIM:SendPointerEvent(st, Enum.PointerType.Touch, pos) end }
-end
-if type(VIM.SendMouseButtonEvent) == "function" then
-    impls[#impls + 1] = { "SendMouseButtonEvent", function(st, id, pos)
-        VIM:SendMouseButtonEvent(pos.X, pos.Y, 0, st == Enum.UserInputState.Begin, game, 1, false)
-    end }
-end
-
-print(("[BF] backend disponivel: %s"):format(
-    next(impls) and table.concat(impls, ", ", function(_, v) return v[1] end)
-    or "nenhum"))
-
-function Input.tap(pos, holdMin, holdMax)
-    if #impls == 0 then return false end
-    Input.seq += 1
-    local id = 7000 + (Input.seq % 2000)
-    local held = rng:NextNumber(holdMin or C.HoldTouch[1], holdMax or C.HoldTouch[2])
-    local start = 1
-    if Input.backend then
-        for i, c in ipairs(impls) do if c[1] == Input.backend then start = i break end end
-    end
-    for a = start, #impls do
-        local ok = pcall(impls[a][2], Enum.UserInputState.Begin, id, pos)
-        if ok then
-            task.wait(held)
-            pcall(impls[a][2], Enum.UserInputState.End, id, pos)
-            Input.backend = impls[a][1]
-            Input.fail = 0
-            return true
-        end
-        Input.fail += 1
+print("[BF] carregado. rode _G.BFStatus() para ver estado. _G.BFCalib() para testar toque. _G.BFStop() para parar.")
+_G.__bf.cfg={WalkRange=24,AttackRange=30,StepJitter={0.55,1.40},HoldTouch={0.045,0.115},AimJitter=9,MissChance=0.06,IdleChance=0.15,SessionSec=1800,Tick=0.25,RiskTween=false,Running=true}
+local C=_G.__bf.cfg
+local Players=game:GetService("Players")
+local VIM=game:GetService("VirtualInputManager")
+local TweenService=game:GetService("TweenService")
+local cam=workspace.CurrentCamera
+local rng=Random.new()
+local p=Players.LocalPlayer
+print("Player: " .. tostring(p.Name))
+local c=p.Character or p.CharacterAdded:Wait()
+print("Character: " .. tostring(c and "OK" or "FALTO"))
+local hrp=c:FindFirstChild("HumanoidRootPart")
+local hum=c:FindFirstChildOfClass("Humanoid")
+print("HRP: " .. tostring(hrp and "OK" or "FALTO"))
+print("Humanoide: " .. tostring(hum and "OK" or "FALTO"))
+if not hrp or not hum then print("ERRO: falta HRP ou Humanoide. aguarde spawn."); _G.__bf.stop=true; return end
+_G.__bf.hrp=hrp
+_G.__bf.hum=hum
+local impls={}
+if type(VIM.SendTouchEvent)=="function" then impls[#impls+1]={ "SendTouchEvent", function(st,id,pos) VIM:SendTouchEvent(st,id,pos) end } end
+if type(VIM.SendPointerEvent)=="function" then impls[#impls+1]={ "SendPointerEvent", function(st,id,pos) VIM:SendPointerEvent(st,Enum.PointerType.Touch,pos) end } end
+if type(VIM.SendMouseButtonEvent)=="function" then impls[#impls+1]={ "SendMouseButtonEvent", function(st,id,pos) VIM:SendMouseButtonEvent(pos.X,pos.Y,0,st==Enum.UserInputState.Begin,game,1,false) end } end
+print("Backends: " .. table.concat(impls,", ",function(_,v)return v[1] end) .. (next(impls) and "" or " NENHUM"))
+local CommF=ReplicatedStorage:FindFirstChild("Remotes",true) and ReplicatedStorage.Remotes:FindFirstChild("CommF_")
+print("CommF_: " .. tostring(CommF and "OK" or "nao encontrado"))
+_G.__bf.backend=nil
+_G.__bf.fail=0
+_G.__bf.seq=0
+local function tap(pos,holdMin,holdMax)
+    if #impls==0 then return false end
+    _G.__bf.seq+=1
+    local id=7000+(_G.__bf.seq%2000)
+    local held=rng:NextNumber(holdMin or C.HoldTouch[1],holdMax or C.HoldTouch[2])
+    local start=1
+    if _G.__bf.backend then for i,b in ipairs(impls) do if b[1]==_G.__bf.backend then start=i break end end end
+    for a=start,#impls do
+        local ok=pcall(impls[a][2],Enum.UserInputState.Begin,id,pos)
+        if ok then task.wait(held); pcall(impls[a][2],Enum.UserInputState.End,id,pos); _G.__bf.backend=impls[a][1]; _G.__bf.fail=0; return true end
+        _G.__bf.fail+=1
     end
     return false
 end
-
-function Input.calibrate()
-    local vp = cam.ViewportSize
-    local ok, name = Input.tap(Vector2.new(vp.X * 0.5, vp.Y * 0.5)), Input.backend
-    print(("[BF] calib: %s -> %s"):format(tostring(name), ok and "enviado" or "NENHUM respondeu"))
-    return ok, name
+_G.BFCalib=function()
+    local vp=cam.ViewportSize
+    local ok,name=tap(Vector2.new(vp.X*0.5,vp.Y*0.5)),_G.__bf.backend
+    print(("[BF] calib: %s -> %s"):format(tostring(name),ok and "enviado" or "NENHUM respondeu"))
+    return ok,name
 end
-
--- ============ RESOLVERS ============
-function World.bind()
-    local c = p.Character
-    if not c or not c:FindFirstChild("HumanoidRootPart") then
-        c = p.CharacterAdded:Wait(20)
-    end
-    if not c then return end
-    World.hrp = c:WaitForChild("HumanoidRootPart", 20)
-    World.hum = c:FindFirstChildOfClass("Humanoid")
-end
-World.bind()
-p.CharacterAdded:Connect(function() task.wait(1); World.bind() end)
-
-local function alive()
-    return World.hrp and World.hum and World.hum.Health > 0
-end
-
+p.CharacterAdded:Connect(function()
+    task.wait(1.2)
+    _G.__bf.hrp=p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+    _G.__bf.hum=p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+end)
+local function alive() return _G.__bf.hrp and _G.__bf.hum and _G.__bf.hum.Health>0 end
 local function nearestMob()
-    local set = workspace:FindFirstChild("Enemies")
-    if not set then return nil, math.huge end
-    local best, d = nil, math.huge
-    for _, m in ipairs(set:GetChildren()) do
-        local h, r = m:FindFirstChildOfClass("Humanoid"), m:FindFirstChild("HumanoidRootPart")
-        if h and r and h.Health > 0 and m.Name ~= "BusoTemplate" then
-            local dist = (r.Position - World.hrp.Position).Magnitude
-            if dist < d then d, best = dist, m end
+    local set=workspace:FindFirstChild("Enemies")
+    if not set then return nil,math.huge end
+    local best,d=nil,math.huge
+    for _,m in ipairs(set:GetChildren()) do
+        local h,r=m:FindFirstChildOfClass("Humanoid"),m:FindFirstChild("HumanoidRootPart")
+        if h and r and h.Health>0 and m.Name~="BusoTemplate" then
+            local dist=(r.Position-_G.__bf.hrp.Position).Magnitude
+            if dist<d then d,best=dist,m end
         end
     end
-    return best, d
+    return best,d
 end
-
 local function screenPos(part)
     if not part then return nil end
-    local sp, on = cam:WorldToViewportPoint(part.Position)
+    local sp,on=cam:WorldToViewportPoint(part.Position)
     if not on then return nil end
-    return Vector2.new(sp.X, sp.Y)
+    return Vector2.new(sp.X,sp.Y)
 end
-
--- ============ MOVIMENTO ============
 local function walkTo(pos)
     if not alive() then return end
-    World.hum:MoveTo(pos + Vector3.new(rng:NextNumber(-2, 2), 0, rng:NextNumber(-2, 2)))
-    local t0 = os.clock()
+    _G.__bf.hum:MoveTo(pos+Vector3.new(rng:NextNumber(-2,2),0,rng:NextNumber(-2,2)))
+    local t0=os.clock()
     repeat
         task.wait(C.Tick)
-        if (World.hrp.Position - pos).Magnitude < 8 then return true end
-    until os.clock() - t0 > 7
+        if (_G.__bf.hrp.Position-pos).Magnitude<8 then return true end
+    until os.clock()-t0>7
     return false
 end
-
 local function tweenTo(pos)
     if not alive() then return end
-    local d = (pos - World.hrp.Position).Magnitude
-    local tw = TweenService:Create(World.hrp, TweenInfo.new(math.max(d / 320, 0.05), Enum.EasingStyle.Linear), { CFrame = CFrame.new(pos) })
+    local d=(pos-_G.__bf.hrp.Position).Magnitude
+    local tw=TweenService:Create(_G.__bf.hrp,TweenInfo.new(math.max(d/320,0.05),Enum.EasingStyle.Linear),{CFrame=CFrame.new(pos)})
     tw:Play()
     pcall(function() tw.Completed:Wait() end)
 end
-
 local function moveTo(pos)
     if C.RiskTween then tweenTo(pos) else walkTo(pos) end
 end
-
--- ============ LOOP PRINCIPAL ============
-_G.BFRunning = true
 task.spawn(function()
-    local t0 = os.clock()
-    while _G.BFRunning and (os.clock() - t0) < C.SessionSec do
-        if not alive() then task.wait(3); World.bind(); continue end
-
-        local mob, dist = nearestMob()
+    print("[BF] farm iniciado")
+    local t0=os.clock()
+    while not _G.__bf.stop and (os.clock()-t0)<C.SessionSec do
+        if not alive() then task.wait(3); continue end
+        local mob,dist=nearestMob()
         if mob then
-            if dist > C.WalkRange then
-                moveTo(mob.HumanoidRootPart.Position)
-            end
-
-            for _ = 1, math.random(3, 6) do
-                local h = mob:FindFirstChildOfClass("Humanoid")
-                if not h or h.Health <= 0 then break end
-                local sp = screenPos(mob.HumanoidRootPart)
-                if sp and math.random() > C.MissChance then
-                    sp = sp + Vector2.new(rng:NextNumber(-C.AimJitter, C.AimJitter),
-                                          rng:NextNumber(-C.AimJitter, C.AimJitter))
-                    Input.tap(sp)
+            if dist>C.WalkRange then moveTo(mob.HumanoidRootPart.Position) end
+            for _=1,math.random(3,6) do
+                local h=mob:FindFirstChildOfClass("Humanoid")
+                if not h or h.Health<=0 then break end
+                local sp=screenPos(mob.HumanoidRootPart)
+                if sp and math.random()>C.MissChance then
+                    sp=sp+Vector2.new(rng:NextNumber(-C.AimJitter,C.AimJitter),rng:NextNumber(-C.AimJitter,C.AimJitter))
+                    tap(sp)
                 end
-                task.wait(rng:NextNumber(C.StepJitter[1], C.StepJitter[2]) / 4)
+                task.wait(rng:NextNumber(C.StepJitter[1],C.StepJitter[2])/4)
             end
         else
-            task.wait(C.Tick * 2)
+            task.wait(C.Tick*2)
         end
-
-        if math.random() < C.IdleChance then
-            task.wait(rng:NextNumber(3, 9))
-        else
-            task.wait(rng:NextNumber(C.StepJitter[1], C.StepJitter[2]))
-        end
+        if math.random()<C.IdleChance then task.wait(rng:NextNumber(3,9))
+        else task.wait(rng:NextNumber(C.StepJitter[1],C.StepJitter[2])) end
     end
     print("[BF] sessao encerrada")
 end)
-
--- ============ CONTROLADOR ============
-_G.BFStop = function()
-    _G.BFRunning = false
-    print("[BF] parado")
-end
-
-_G.BFSet = function(k, v)
-    C[k] = v
-    print(("[BF] %s = %s"):format(k, tostring(v)))
-end
-
-_G.BFCalib = function()
-    local vp = cam.ViewportSize
-    local ok, name = Input.tap(Vector2.new(vp.X * 0.5, vp.Y * 0.5)), Input.backend
-    print(("[BF] calib: %s -> %s"):format(tostring(name), ok and "enviado" or "NENHUM respondeu"))
-    return ok, name
-end
